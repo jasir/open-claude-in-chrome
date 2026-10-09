@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Open Claude in Chrome",
-  "version": "1.0.0",
-  "description": "Claude in Chrome, open source. No domain blocklist. Any Chromium browser.",
+  "version": "1.0.0.1",
+  "description": "Claude in Chrome, open source (fork jasir: bez nahrávače, více prohlížečů paralelně).",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuCmVf0i2wUhsy+nt/8OETG14KGB3W3MoUKaUTrwTIWsf+me2r+VVeT0vR6C1HebUqVPnOt64FmE1eOv0ER09ec3iLoLLExU8ciVqZY7rmWqtD034kb2SIK10TRhr1f+p+/uJ01jwg4e6gPbh32W8NG1ROIn5SeoKDiomW64WzgYTeg9otsxywF6sq3HZoooFsieZC9YOYHaMoM5u+Hgt8I3vJe6Jf/OQHrBRURP/C+9AYarMS/2ujQZHyYTaH9mLkkZZ02x9wVc2Nc3bNUx1ZMheVYNVBRsd1tqzsOCexxmXT6BSKGOB/fNKgN+boNWalhpKPki0IoV53EHTktH+rQIDAQAB",
   "minimum_chrome_version": "116",
   "permissions": [
     "tabs",
@@ -14,7 +15,6 @@
     "windows",
     "storage",
     "alarms",
-    "offscreen",
     "clipboardWrite"
   ],
   "host_permissions": [
@@ -25,9 +25,8 @@
     "type": "module"
   },
   "action": {
-    "default_title": "Open Claude in Chrome \u2014 click to start/stop recording"
+    "default_title": "Open Claude in Chrome"
   },
-  "options_page": "recorder/options.html",
   "content_scripts": [
     {
       "matches": [
@@ -38,16 +37,6 @@
       ],
       "run_at": "document_idle",
       "all_frames": false
-    },
-    {
-      "matches": [
-        "<all_urls>"
-      ],
-      "js": [
-        "recorder/capture.js"
-      ],
-      "run_at": "document_start",
-      "all_frames": true
     }
   ],
   "icons": {

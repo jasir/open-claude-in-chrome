@@ -144,6 +144,48 @@ check("env override wins on every platform", () => {
   }
 });
 
+// Fork jasir: one bridge per browser.
+function withBrowser(env, argv, fn) {
+  const savedArgv = process.argv;
+  if (env === undefined) delete process.env.OCIC_BROWSER;
+  else process.env.OCIC_BROWSER = env;
+  process.argv = [...savedArgv.slice(0, 2), ...argv];
+  try {
+    return fn();
+  } finally {
+    process.argv = savedArgv;
+    delete process.env.OCIC_BROWSER;
+  }
+}
+
+check("OCIC_BROWSER gives each browser its own socket", () => {
+  const brave = withBrowser("brave", [], () => asPlatform("linux", () => getPipePath()));
+  const chrome = withBrowser("chrome", [], () => asPlatform("linux", () => getPipePath()));
+  const shared = withBrowser(undefined, [], () => asPlatform("linux", () => getPipePath()));
+  assert(brave === path.join(socketDir(), "bridge-brave.sock"), `brave: ${brave}`);
+  assert(chrome !== brave, "chrome and brave share a socket");
+  assert(shared === path.join(socketDir(), "bridge.sock"), `unset: ${shared}`);
+  const win = withBrowser("brave", [], () => asPlatform("win32", () => getPipePath()));
+  assert(win.endsWith("-brave"), `windows pipe: ${win}`);
+});
+
+check("--browser on the command line wins over OCIC_BROWSER", () => {
+  const p = withBrowser("chrome", ["--browser", "brave"], () => asPlatform("linux", () => getPipePath()));
+  assert(p.endsWith("bridge-brave.sock"), p);
+});
+
+check("a browser name that could escape the socket dir is rejected", () => {
+  for (const bad of ["../x", "a/b", "a b", "x".repeat(33)]) {
+    let threw = false;
+    try {
+      withBrowser(bad, [], () => asPlatform("linux", () => getPipePath()));
+    } catch {
+      threw = true;
+    }
+    assert(threw, `accepted "${bad}"`);
+  }
+});
+
 const failed = results.filter((r) => !r.ok);
 console.log(
   `\n${results.length - failed.length}/${results.length} passed` +

@@ -52,10 +52,28 @@ export function getPipePath() {
   // Windows pipe names live in a flat namespace and allow almost anything;
   // POSIX socket paths are length-limited (~104 bytes), so keep both short.
   const user = currentUser().replace(/[^\w.-]/g, "_").slice(0, 32);
+  // Fork jasir: one bridge per browser, so several browsers can be driven in
+  // parallel. The native host gets OCIC_BROWSER from its per-browser wrapper
+  // (install.sh), the MCP server from its own config (`--browser` or env).
+  const browser = browserName();
   if (process.platform === "win32") {
-    return `\\\\.\\pipe\\open-claude-in-chrome-${user}`;
+    return `\\\\.\\pipe\\open-claude-in-chrome-${user}${browser ? "-" + browser : ""}`;
   }
-  return path.join(socketDir(), "bridge.sock");
+  return path.join(socketDir(), browser ? `bridge-${browser}.sock` : "bridge.sock");
+}
+
+// `--browser NAME` on the command line wins over OCIC_BROWSER. Unset means the
+// upstream single shared bridge. The name only ever becomes part of a path, so
+// anything outside [A-Za-z0-9_-] is rejected rather than escaped.
+export function browserName() {
+  const i = process.argv.indexOf("--browser");
+  if (i !== -1 && !process.argv[i + 1]) throw new Error("--browser needs a name");
+  const raw = i !== -1 ? process.argv[i + 1] : process.env.OCIC_BROWSER;
+  if (!raw) return "";
+  if (!/^[A-Za-z0-9_-]{1,32}$/.test(raw)) {
+    throw new Error(`Invalid browser name "${raw}" (allowed: A-Z a-z 0-9 _ -, max 32)`);
+  }
+  return raw;
 }
 
 // POSIX only: a 0700 directory so the socket inside it is unreachable by other

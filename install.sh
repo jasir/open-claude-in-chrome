@@ -1,252 +1,127 @@
-#!/bin/bash
-set -e
-
-# Install script for Open Claude in Chrome extension.
-# Registers the native messaging host for Chrome, Edge, and Brave on
-# macOS, Linux, and Windows (run under Git Bash / MSYS2 / Cygwin).
+#!/usr/bin/env bash
+# Registrace native hostu pro jeden nebo více prohlížečů (fork jasir, jen Linux).
 #
-# Usage: ./install.sh <extension-id> [extension-id-2] [extension-id-3] ...
+#   ./install.sh                         výchozí prohlížeče (DEFAULT_TARGETS), které na stroji jsou
+#   ./install.sh brave chrome            jen vybrané z výchozích
+#   ./install.sh kosik=~/.config/chrome-kosik   vlastní jméno = user-data-dir
+#   ./install.sh --remove brave          odregistrovat
 #
-# Pass one extension ID per browser. Each Chromium browser assigns a different
-# ID when loading unpacked extensions, so if you use both Chrome and Brave,
-# pass both IDs.
+# Každý prohlížeč (přesněji každý user-data-dir) dostane vlastní wrapper
+# host/native-host-<jméno>.sh s OCIC_BROWSER=<jméno>, takže jeho native host
+# drží vlastní socket bridge-<jméno>.sock a prohlížeče jdou ovládat paralelně.
+# Chromium na Linuxu hledá uživatelské native hosty v <user-data-dir>/NativeMessagingHosts,
+# proto funguje i instance s vlastním --user-data-dir (chrome-debug).
+#
+# ID rozšíření je pevné (klíč v extension/manifest.json), ručně se nezadává.
+# MCP server pro Claude Code a Codex zaregistruje ./mcp-register.sh.
 
-if [ -z "$1" ]; then
-  echo "Usage: ./install.sh <extension-id> [extension-id-2] ..."
-  echo ""
-  echo "Pass one extension ID per browser you want to use."
-  echo "Each browser assigns a different ID to the same unpacked extension."
-  echo ""
-  echo "Steps:"
-  echo "  1. Open chrome://extensions (and/or brave://extensions)"
-  echo "  2. Enable Developer Mode"
-  echo "  3. Click 'Load unpacked' and select the extension/ directory"
-  echo "  4. Copy the extension ID shown under the extension name"
-  echo "  5. Repeat for each browser"
-  echo "  6. Run: ./install.sh <chrome-id> <brave-id>"
-  exit 1
-fi
+set -euo pipefail
 
-EXTENSION_IDS=("$@")
+declare -A DEFAULT_TARGETS=(
+  [brave]="$HOME/.config/BraveSoftware/Brave-Browser"
+  [chrome]="$HOME/.config/google-chrome"
+  [chrome-debug]="$HOME/.config/chrome-mcp-debug"
+)
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOST_DIR="$SCRIPT_DIR/host"
 HOST_NAME="com.anthropic.open_claude_in_chrome"
 
-# Platform detection. Windows is reached when the script runs under Git Bash,
-# MSYS2, or Cygwin (uname reports MINGW*/MSYS*/CYGWIN*).
-case "$(uname)" in
-  Darwin) OS_KIND="mac" ;;
-  Linux) OS_KIND="linux" ;;
-  MINGW*|MSYS*|CYGWIN*) OS_KIND="windows" ;;
-  *) OS_KIND="unknown" ;;
-esac
+[[ "$(uname)" == Linux ]] || { echo "Tento fork instaluje jen na Linuxu (upstream install.sh je v historii gitu)." >&2; exit 1; }
 
-# Verify node is available
-if ! command -v node &> /dev/null; then
-  echo "Error: node is not installed. Install Node.js first."
-  exit 1
+NODE="$(command -v node)" || { echo "Chybí node." >&2; exit 1; }
+bad_path() { [[ -z "$1" || "$1" == *"'"* || "$1" == *$'\n'* ]]; }
+! bad_path "$NODE$HOST_DIR" || { echo "Cesta s apostrofem nebo novým řádkem není podporovaná." >&2; exit 1; }
+
+EXT_ID="$(python3 - "$SCRIPT_DIR/extension/manifest.json" <<'EOF'
+import base64, hashlib, json, sys
+key = json.load(open(sys.argv[1]))["key"]
+h = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
+print("".join(chr(ord("a") + int(c, 16)) for c in h))
+EOF
+)"
+
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || { echo "Neplatné jméno '$1' (A-Z a-z 0-9 _ -)." >&2; exit 1; }; }
+
+# jméno nebo jméno=adresář → "jméno<TAB>adresář"
+resolve() {
+  local arg="$1" name dir
+  if [[ "$arg" == *=* ]]; then
+    name="${arg%%=*}"; dir="${arg#*=}"; dir="${dir/#\~/$HOME}"
+  else
+    name="$arg"; dir="${DEFAULT_TARGETS[$arg]:-}"
+    [[ -n "$dir" ]] || { echo "Neznámý prohlížeč '$arg', použij jméno=user-data-dir." >&2; exit 1; }
+  fi
+  valid_name "$name"
+  ! bad_path "$dir" || { echo "Neplatný adresář pro '$name'." >&2; exit 1; }
+  printf '%s\t%s\n' "$name" "$dir"
+}
+
+REMOVE=0
+if [[ "${1:-}" == --remove ]]; then REMOVE=1; shift; fi
+
+TARGETS=()
+if [[ $# -eq 0 ]]; then
+  [[ $REMOVE -eq 0 ]] || { echo "Použití: ./install.sh --remove jméno…" >&2; exit 1; }
+  for n in "${!DEFAULT_TARGETS[@]}"; do
+    [[ -d "${DEFAULT_TARGETS[$n]}" ]] && TARGETS+=("$(resolve "$n")")
+  done
+else
+  for a in "$@"; do TARGETS+=("$(resolve "$a")"); done
 fi
 
-# Verify npm dependencies are installed
-if [ ! -d "$HOST_DIR/node_modules" ]; then
-  echo "Installing npm dependencies..."
-  cd "$HOST_DIR" && npm install
-  cd "$SCRIPT_DIR"
+if [[ $REMOVE -eq 0 && ! -d "$HOST_DIR/node_modules" ]]; then
+  echo "Instaluji závislosti hostu…"
+  npm install --prefix "$HOST_DIR" --no-fund --no-audit
 fi
 
-# The codemode/hybrid servers bundle a Cloudflare Worker (execute_code) that
-# imports @cloudflare/codemode; wrangler's build fails if the worker's own
-# dependencies aren't installed. Install them here so execute_code works.
-WORKER_DIR="$HOST_DIR/codemode/worker"
-if [ -f "$WORKER_DIR/package.json" ] && [ ! -d "$WORKER_DIR/node_modules" ]; then
-  echo "Installing codemode worker dependencies..."
-  cd "$WORKER_DIR" && npm install
-  cd "$SCRIPT_DIR"
-fi
+for t in "${TARGETS[@]}"; do
+  IFS=$'\t' read -r name dir <<<"$t"
+  wrapper="$HOST_DIR/native-host-$name.sh"
+  manifest="$dir/NativeMessagingHosts/$HOST_NAME.json"
 
-# Build allowed_origins array from all extension IDs
-ORIGINS=""
-for i in "${!EXTENSION_IDS[@]}"; do
-  if [ $i -gt 0 ]; then ORIGINS="$ORIGINS,"; fi
-  ORIGINS="$ORIGINS
-    \"chrome-extension://${EXTENSION_IDS[$i]}/\""
+  if [[ $REMOVE -eq 1 ]]; then
+    rm -f "$wrapper" "$manifest"
+    echo "  $name: odregistrováno"
+    continue
+  fi
+
+  if [[ ! -d "$dir" ]]; then
+    echo "  $name: přeskočeno, $dir neexistuje"
+    continue
+  fi
+
+  cat >"$wrapper" <<EOF
+#!/bin/sh
+# Vygenerováno install.sh – native host pro prohlížeč '$name' ($dir).
+OCIC_BROWSER='$name' exec '$NODE' '$HOST_DIR/native-host.js' "\$@"
+EOF
+  chmod +x "$wrapper"
+
+  mkdir -p "$(dirname "$manifest")"
+  python3 - "$manifest" "$wrapper" "$EXT_ID" "$name" <<'EOF'
+import json, sys
+path, wrapper, ext_id, name = sys.argv[1:]
+json.dump({
+    "name": "com.anthropic.open_claude_in_chrome",
+    "description": f"Open Claude in Chrome native host ({name})",
+    "path": wrapper,
+    "type": "stdio",
+    "allowed_origins": [f"chrome-extension://{ext_id}/"],
+}, open(path, "w"), indent=2)
+EOF
+  echo "  $name: $manifest"
 done
 
-# JSON-escape backslashes so a Windows path can be embedded in the manifest
-# (POSIX paths contain none, so this is a no-op on macOS/Linux).
-json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
+[[ $REMOVE -eq 1 ]] && exit 0
 
-# Native messaging host manifest. $1 = the host executable path, already
-# JSON-escaped for the current platform.
-generate_manifest() {
-  cat << EOF
-{
-  "name": "$HOST_NAME",
-  "description": "Open Claude in Chrome Native Messaging Host",
-  "path": "$1",
-  "type": "stdio",
-  "allowed_origins": [$ORIGINS
-  ]
-}
+cat <<EOF
+
+ID rozšíření: $EXT_ID
+
+Dál:
+  1. V každém prohlížeči: <prohlížeč>://extensions → Režim pro vývojáře → Načíst rozbalené
+     → $SCRIPT_DIR/extension
+  2. Prohlížeč úplně zavřít a znovu spustit (native hosty čte při startu).
+  3. ./mcp-register.sh <jméno>…   (MCP server ocic-<jméno> pro Claude Code a Codex přes mcp-lazy)
 EOF
-}
-
-# ---------------------------------------------------------------------------
-# macOS / Linux: a POSIX wrapper script + one manifest file per browser, in
-# that browser's NativeMessagingHosts directory.
-# ---------------------------------------------------------------------------
-create_unix_wrapper() {
-  NATIVE_HOST_PATH="$HOST_DIR/native-host-wrapper.sh"
-  cat > "$NATIVE_HOST_PATH" << WRAPPER
-#!/bin/sh
-exec "$(command -v node)" "$HOST_DIR/native-host.js"
-WRAPPER
-  chmod +x "$NATIVE_HOST_PATH"
-  echo "Created native host wrapper: $NATIVE_HOST_PATH"
-}
-
-install_host() {
-  local browser_name="$1"
-  local host_dir="$2"
-
-  if [ ! -d "$(dirname "$host_dir")" ]; then
-    echo "  Skipping $browser_name (not installed)"
-    return
-  fi
-
-  mkdir -p "$host_dir"
-  generate_manifest "$(json_escape "$NATIVE_HOST_PATH")" > "$host_dir/$HOST_NAME.json"
-  echo "  Installed for $browser_name: $host_dir/$HOST_NAME.json"
-}
-
-# ---------------------------------------------------------------------------
-# Windows: Chromium browsers locate a native host through a registry value
-# under HKCU\Software\<vendor>\NativeMessagingHosts\<name> that points at the
-# manifest JSON; the manifest in turn points at an executable the browser can
-# launch — a .bat, not a shell script. HKCU keeps this per-user (no admin).
-# ---------------------------------------------------------------------------
-install_windows() {
-  local node_posix node_win host_js_win bat_path bat_win manifest_path
-
-  node_posix="$(command -v node)"
-  # Git Bash reports node without the .exe suffix; add it back so the wrapper
-  # resolves even when Chrome launches it with a minimal PATH.
-  if [ -f "${node_posix}.exe" ]; then node_posix="${node_posix}.exe"; fi
-  node_win="$(cygpath -w "$node_posix")"
-  host_js_win="$(cygpath -w "$HOST_DIR/native-host.js")"
-
-  # The .bat Chrome launches. CRLF endings; %* forwards Chrome's args (the
-  # extension origin + parent-window handle, which the host ignores). cmd.exe
-  # hands node the inherited std handles, so Chrome's binary native-messaging
-  # stream flows straight to/from node — cmd never sits in the pipe.
-  bat_path="$HOST_DIR/native-host-wrapper.bat"
-  printf '@echo off\r\n"%s" "%s" %%*\r\n' "$node_win" "$host_js_win" > "$bat_path"
-  echo "Created native host wrapper: $bat_path"
-
-  # One manifest, referenced by every browser's registry key.
-  manifest_path="$HOST_DIR/$HOST_NAME.json"
-  bat_win="$(cygpath -w "$bat_path")"
-  generate_manifest "$(json_escape "$bat_win")" > "$manifest_path"
-  MANIFEST_WIN="$(cygpath -w "$manifest_path")"
-  echo "Wrote manifest: $manifest_path"
-
-  echo ""
-  echo "Registering native messaging host in the registry (HKCU)..."
-  win_reg_add "Google Chrome" 'HKCU\Software\Google\Chrome\NativeMessagingHosts'
-  win_reg_add "Microsoft Edge" 'HKCU\Software\Microsoft\Edge\NativeMessagingHosts'
-  win_reg_add "Brave" 'HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts'
-}
-
-# Point one browser's registry hive at the manifest. The // on reg's switches
-# is the Git-Bash convention that survives MSYS argument munging (// -> /);
-# the C:\ manifest path and the HKCU\... key are Windows-form already, so MSYS
-# leaves them untouched.
-win_reg_add() {
-  local browser="$1" hive="$2"
-  if reg.exe add "$hive\\$HOST_NAME" //ve //t REG_SZ //d "$MANIFEST_WIN" //f >/dev/null 2>&1; then
-    echo "  Registered for $browser"
-  else
-    echo "  Could not register for $browser"
-  fi
-}
-
-echo ""
-echo "Installing native messaging host for extension(s): ${EXTENSION_IDS[*]}"
-echo ""
-
-case "$OS_KIND" in
-  mac)
-    create_unix_wrapper
-    install_host "Google Chrome" \
-      "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
-    install_host "Microsoft Edge" \
-      "$HOME/Library/Application Support/Microsoft Edge/NativeMessagingHosts"
-    install_host "Brave Browser" \
-      "$HOME/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts"
-    ;;
-  linux)
-    create_unix_wrapper
-    install_host "Google Chrome" \
-      "$HOME/.config/google-chrome/NativeMessagingHosts"
-    install_host "Microsoft Edge" \
-      "$HOME/.config/microsoft-edge/NativeMessagingHosts"
-    install_host "Brave Browser" \
-      "$HOME/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts"
-    install_host "Chromium" \
-      "$HOME/.config/chromium/NativeMessagingHosts"
-    # Flatpak browsers are sandboxed: they never read ~/.config, only their
-    # own per-app tree, where Flatpak maps ~/.config -> ~/.var/app/<id>/config.
-    # install_host skips any browser whose directory isn't there, so these are
-    # a no-op on a machine with no Flatpak browser installed.
-    install_host "Brave Browser (Flatpak)" \
-      "$HOME/.var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser/NativeMessagingHosts"
-    install_host "Google Chrome (Flatpak)" \
-      "$HOME/.var/app/com.google.Chrome/config/google-chrome/NativeMessagingHosts"
-    install_host "Microsoft Edge (Flatpak)" \
-      "$HOME/.var/app/com.microsoft.Edge/config/microsoft-edge/NativeMessagingHosts"
-    install_host "Chromium (Flatpak)" \
-      "$HOME/.var/app/org.chromium.Chromium/config/chromium/NativeMessagingHosts"
-    # Registering the manifest is necessary but not always sufficient under
-    # Flatpak: the sandbox must also be allowed to launch the host wrapper,
-    # which lives outside it. Only mention this when a Flatpak browser exists.
-    if [ -d "$HOME/.var/app/com.brave.Browser" ] \
-      || [ -d "$HOME/.var/app/com.google.Chrome" ] \
-      || [ -d "$HOME/.var/app/com.microsoft.Edge" ] \
-      || [ -d "$HOME/.var/app/org.chromium.Chromium" ]; then
-      echo ""
-      echo "  Note: a Flatpak browser was detected. Flatpak sandboxes the browser,"
-      echo "  so it also needs permission to run the native host from your home dir:"
-      echo "    flatpak override --user --filesystem=home <app-id>"
-      echo "  (e.g. com.brave.Browser), then fully restart the browser."
-    fi
-    ;;
-  windows)
-    install_windows
-    ;;
-  *)
-    echo "Error: Unsupported platform $(uname)."
-    echo "This script supports macOS, Linux, and Windows (via Git Bash/MSYS2/Cygwin)."
-    exit 1
-    ;;
-esac
-
-# Path to mcp-server.js shown in the copy-paste hint, in the current OS's
-# native form (cygpath yields a clean C:\...\host\mcp-server.js on Windows).
-if [ "$OS_KIND" = "windows" ]; then
-  MCP_SERVER_DISPLAY="$(cygpath -w "$HOST_DIR/mcp-server.js")"
-else
-  MCP_SERVER_DISPLAY="$HOST_DIR/mcp-server.js"
-fi
-
-echo ""
-echo "Done! Next steps:"
-echo ""
-echo "  1. Restart your browser (close all windows and reopen)"
-echo "  2. Add the MCP server to Claude Code:"
-echo ""
-echo "     claude mcp add open-claude-in-chrome -- node \"$MCP_SERVER_DISPLAY\""
-echo ""
-echo "  3. Start a new Claude Code session and test:"
-echo ""
-echo '     Ask Claude: "Navigate to reddit.com and take a screenshot"'
-echo ""

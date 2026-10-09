@@ -594,18 +594,6 @@ export const TOOLS = [
     }
   },
   {
-    name: "retranscribe_recording",
-    description:
-      "Re-run transcription for a saved recording whose transcript failed at stop (e.g. a transient OpenAI error). Re-assembles the durable audio segments, re-transcribes them, and patches trace.json on disk, overwriting the previous transcript. Returns the updated transcript status and utterance count. Constraints: only works for the MOST RECENT recording recorded after this feature shipped (a newer recording clears the in-browser audio store; older sessions lack the segment anchors needed to map timestamps). Only call it to recover a recording whose transcript actually failed — re-running on a good one replaces the transcript with a fresh result and could worsen it if OpenAI is currently failing.",
-    paramShape: {
-      recording_id: z
-        .string()
-        .describe(
-          "The recording_id shown in the bundle path after a recording_complete notification (e.g. the timestamp-based id)."
-        )
-    }
-  },
-  {
     name: "file_upload",
     description:
       "Upload one or more local files (by absolute path) to a file input element on the page. Use read_page or find to locate the <input type=\"file\">, then pass its ref — do not click file inputs, which opens a native picker you cannot see. Each file must already exist on this machine (the same machine as the browser); the real path is passed straight to the browser, no staging. Keep the combined size of all files in a single call under ~10 MB.",

@@ -20,3 +20,6 @@ benchmark/__pycache__/
 
 # personal research data — never commit
 DO_NOT_COMMIT/
+
+# fork jasir: per-browser native host wrappers from install.sh
+host/native-host-*.sh

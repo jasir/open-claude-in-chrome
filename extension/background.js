@@ -3172,23 +3172,10 @@ async function activeTabUrl() {
   }
 }
 
-// The icon is a start/stop toggle (§9 — non-negotiable). Hydrate first: after
-// an SW eviction the in-memory flag is a lie, and acting on it destroys the
-// in-flight recording.
-chrome.action.onClicked.addListener(() => {
-  recorderReady
-    .then(() => {
-      // Busy = booting the mic or processing a stop: the click is IGNORED.
-      // The toggle is live only when idle, recording, or showing a result.
-      if (recorder.busy) return;
-      recorder.busy = true;
-      const op = recorder.active ? stopRecording() : startRecording();
-      return op.finally(() => {
-        recorder.busy = false; // safety net; the copied-path clears it earlier
-      });
-    })
-    .catch((e) => console.error("recorder toggle failed", e));
-});
+// Fork jasir: the imitation-learning recorder is switched off. The manifest no
+// longer injects recorder/capture.js nor grants `offscreen`, and the icon no
+// longer starts a recording (upstream toggled startRecording/stopRecording here).
+// The recorder code below stays inert so upstream merges remain small.
 
 // Behavior events from content scripts → offscreen buffer. Tab segmentation.
 // Every gate awaits hydration: an event arriving right after SW wake-up must
