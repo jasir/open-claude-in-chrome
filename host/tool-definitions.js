@@ -171,6 +171,12 @@ export const TOOLS = [
         .describe(
           'The text to type (for `type` action) or the key(s) to press (for `key` action). For `key` action: Provide space-separated keys (e.g., "Backspace Backspace Delete"). Supports keyboard shortcuts using the platform\'s modifier key (use "cmd" on Mac, "ctrl" on Windows/Linux, e.g., "cmd+a" or "ctrl+a" for select all).'
         ),
+      if_changed: z
+        .boolean()
+        .optional()
+        .describe(
+          "Optional, for the `screenshot` action. Set true to skip sending the image when it is identical to the previous screenshot of this tab; the result then names the earlier screenshot ID instead. Saves tokens when polling a page. Default false."
+        ),
       save_to_disk: z
         .boolean()
         .optional()
@@ -409,6 +415,12 @@ export const TOOLS = [
         .optional()
         .describe(
           "Maximum characters for output (default: 50000). Set to a higher value if your client can handle large outputs."
+        ),
+      delta: z
+        .boolean()
+        .optional()
+        .describe(
+          "Set true to return only the lines that changed since the previous read_page of this tab with the same URL and options (lines prefixed '- ' removed, '+ ' added, '@@ line N @@' = position in the new tree), or 'Unchanged' when nothing changed. Refs in unchanged lines stay valid. Only use it while the previous read_page output is still in your context. Falls back to the full tree on the first call, after navigation, when output is truncated, or when most of the page changed. Default false."
         )
     }
   },

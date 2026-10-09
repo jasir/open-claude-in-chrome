@@ -10,6 +10,7 @@ for t in test/*.test.mjs; do node "$t" || break; done
 |---|---|
 | `humanize-planners.test.mjs` | The pure planners in `extension/humanize/`. Asserts the invariants that make humanization safe: a click always lands exactly on its target (including 8×8px targets), typed text reassembles byte-identically (incl. unicode/emoji), scroll deltas sum to exactly the requested amount, key hold stays below the OS typematic initial delay, and a deliberate long hold renders the real auto-repeat sequence. |
 | `humanize-executor.test.mjs` | The plan→CDP seam: runs the shipped `dispatchPlan` against a mock CDP layer and asserts the exact calls, their order (`keydown → insertText → keyup` per character), and per-tab cursor continuity. This is the layer that caught the missing shifted-digit key mappings. |
+| `delta.test.mjs` | Fork jasir: `read_page` `delta` (line diff, Unchanged, fallback to the full tree after navigation, option change, truncation or an error string) and screenshot `if_changed` dedupe (keeps the earlier image stored, never names an evicted ID). |
 | `handlers.test.mjs` | Tool handlers against a mocked `chrome.*` API: that creating a tab never selects it or raises a window (#28), that `set_tab_focus` is quiet unless `focus_window` is set (#35), and the layered default/per-tab config with its storage scoping. |
 
 `_extract.mjs` pulls the functions under test out of `extension/background.js` by

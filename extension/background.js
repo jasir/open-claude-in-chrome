@@ -467,6 +467,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   networkRequests.delete(tabId);
   networkByRequestId.delete(tabId);
   cursorByTab.delete(tabId);
+  lastPageTrees.delete(tabId);
+  lastShotHashes.delete(tabId);
   // Drop any per-tab config override too: tab ids are recycled by the browser,
   // so a stale override would silently apply to an unrelated future tab.
   if (configState.byTab[String(tabId)]) {
@@ -641,6 +643,78 @@ async function resolveRefToCoordinates(tabId, ref, opts = {}) {
     scrollIntoView: opts.scrollIntoView !== false
   });
   return resp?.result || null;
+}
+
+// --- Change-only reads (fork jasir) ---
+// read_page with delta:true and a screenshot with if_changed:true return only
+// what changed since the previous call on the same tab, so an agent stepping
+// through a page doesn't pay for the whole tree or image again. Refs (ref_N)
+// are stable across calls (content.js keeps them per element), so a line diff
+// of two trees is meaningful.
+const lastPageTrees = new Map(); // tabId -> { key, tree }
+const lastShotHashes = new Map(); // tabId -> { hash, imageId }
+
+// Line diff of two read_page trees. Returns null when the change is too big for
+// a delta to be cheaper than the full tree.
+function treeDelta(prevTree, nextTree) {
+  const a = prevTree.split("\n");
+  const b = nextTree.split("\n");
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+  let endA = a.length, endB = b.length;
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA--; endB--; }
+  const midA = a.slice(start, endA);
+  const midB = b.slice(start, endB);
+  if (midA.length * midB.length > 4000000) return null;
+  // LCS over the changed middle only.
+  const n = midA.length, m = midB.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i][j] = midA[i] === midB[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out = [];
+  let i = 0, j = 0, removed = 0, added = 0;
+  let inHunk = false;
+  // "@@ line N @@" = where in the NEW tree the following change sits.
+  const mark = () => { if (!inHunk) { out.push(`@@ line ${start + j + 1} @@`); inHunk = true; } };
+  while (i < n || j < m) {
+    if (i < n && j < m && midA[i] === midB[j]) { i++; j++; inHunk = false; }
+    else if (j < m && (i >= n || dp[i][j + 1] >= dp[i + 1][j])) { mark(); out.push("+ " + midB[j++]); added++; }
+    else { mark(); out.push("- " + midA[i++]); removed++; }
+  }
+  const text =
+    `Delta vs previous read_page (${a.length} -> ${b.length} lines): ${removed} removed, ${added} added. ` +
+    `Unchanged lines and their refs are still valid.\n` + out.join("\n");
+  if (text.length >= nextTree.length * 0.7) return null;
+  return text;
+}
+
+// Remember this tab's screenshot hash. When the image is identical to the
+// previous one and that one is still in screenshotStore, drop the duplicate
+// capture, move the earlier entry to the newest slot (so it isn't evicted) and
+// return its ID; otherwise return null.
+function dedupeScreenshot(tabId, base64, imageId) {
+  const hash = hashString(base64);
+  const prev = lastShotHashes.get(tabId);
+  const same = prev?.hash === hash && screenshotStore.has(prev.imageId);
+  if (same) {
+    screenshotStore.delete(imageId);
+    const prevData = screenshotStore.get(prev.imageId);
+    screenshotStore.delete(prev.imageId);
+    screenshotStore.set(prev.imageId, prevData);
+  }
+  lastShotHashes.set(tabId, { hash, imageId: same ? prev.imageId : imageId });
+  return same ? prev.imageId : null;
+}
+
+// Cheap content hash for "has this screenshot changed" (FNV-1a over base64).
+function hashString(str) {
+  let h = 0x811c9dc5;
+  for (let k = 0; k < str.length; k++) {
+    h ^= str.charCodeAt(k);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16) + ":" + str.length;
 }
 
 // --- Screenshot helper ---
@@ -1448,6 +1522,10 @@ const toolHandlers = {
     switch (action) {
       case "screenshot": {
         const { base64, imageId } = await takeScreenshot(tabId);
+        const prevShotId = dedupeScreenshot(tabId, base64, imageId);
+        if (args.if_changed && prevShotId && !args.save_to_disk) {
+          return { content: [{ type: "text", text: `Screenshot unchanged since ${prevShotId} (identical image, not sent again).` }] };
+        }
         // Get viewport dimensions for the response message
         let dims = "";
         try {
@@ -1785,6 +1863,25 @@ const toolHandlers = {
     });
 
     let tree = resp?.result || "Error: Could not generate accessibility tree";
+    // Error strings ("Error: ref_id ... not found") are not trees: never cache
+    // or diff them.
+    if (resp?.result && !resp.result.startsWith("Error:")) {
+      let url = "";
+      try { url = (await chrome.tabs.get(tabId)).url || ""; } catch {}
+      const key = JSON.stringify([url, args.filter || "all", args.depth ?? null, args.ref_id || null, args.max_chars ?? null]);
+      const prev = lastPageTrees.get(tabId);
+      lastPageTrees.set(tabId, { key, tree });
+      if (args.delta) {
+        if (!prev) tree = "(delta: no previous read_page on this tab — full tree)\n" + tree;
+        else if (prev.key !== key) tree = "(delta: URL or read options changed — full tree)\n" + tree;
+        // A truncated tree hides everything past max_chars, so "unchanged" or a
+        // diff of the visible part could miss real changes.
+        else if (/\.\.\. \(truncated\)\s*$/.test(tree) || /\.\.\. \(truncated\)\s*$/.test(prev.tree))
+          tree = "(delta: output truncated by max_chars, changes past the cutoff can't be detected — full tree)\n" + tree;
+        else if (prev.tree === tree) tree = `Unchanged since previous read_page (${tree.split("\n").length} lines); previous output and refs are still valid.`;
+        else tree = treeDelta(prev.tree, tree) || "(delta: too many changes — full tree)\n" + tree;
+      }
+    }
     // Append viewport dimensions so Claude knows the coordinate space
     try {
       await ensureAttached(tabId);

@@ -17,6 +17,12 @@ Fork [noemica-io/open-claude-in-chrome](https://github.com/noemica-io/open-claud
   aby šly snadno přebírat změny z upstreamu.
 - **Pryč:** `benchmark/` (355 MB), `scratch/`, `REAL/`, `host/codemode/` (sandbox s Cloudflare Workerem).
 - **Pevné ID rozšíření** `ppklppeameifkpjiahjebdlfgmcpbghm` (klíč v manifestu), stejné ve všech prohlížečích.
+- **Čtení jen změn (úspora tokenů, inspirováno vercel-labs/agent-browser):**
+  `read_page` s `delta: true` vrátí jen změněné řádky stromu od minulého čtení záložky
+  (`- ` pryč, `+ ` nové, `@@ line N @@` pozice; `Unchanged`, když se nic nezměnilo).
+  Po navigaci, změně filtru, oříznutí `max_chars` nebo velké změně vrátí celý strom.
+  `computer` → `screenshot` s `if_changed: true` stejný obrázek znovu neposílá,
+  vrátí ID předchozího.
 - **Líné MCP:** `mcp-register.sh` registruje servery přes `~/scripts-ai/mcp-lazy`, node běží jen při používání.
 
 ## Architektura
