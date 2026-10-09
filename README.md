@@ -54,6 +54,8 @@ native host restartuje s dalším připojením rozšíření (nebo obnovit rozš
   most drží jen první. Řešení: profil s vlastním `--user-data-dir`.
 - Víc agentů na **stejném** prohlížeči jde (host multiplexuje), ale sdílí skupinu záložek „MCP“;
   každý má pracovat ve vlastní záložce (`tabs_create_mcp`).
+- `computer` → `screenshot` záložky na pozadí visí do timeoutu (20 s); nejdřív `set_tab_focus`.
+  `get_page_text` a `navigate` fungují i na pozadí (ověřeno 2026-10-09 v Brave).
 - Upstream odstranil blocklist domén oficiálního rozšíření – agent smí kamkoli včetně bankovnictví.
 
 ## Testy
