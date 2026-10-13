@@ -250,23 +250,59 @@ function nativeRequest(msg) {
 }
 
 // --- Tab group management ---
-async function ensureTabGroup(createIfEmpty) {
-  // Check if our tab group still exists
-  if (tabGroupId !== null) {
-    try {
-      const group = await chrome.tabGroups.get(tabGroupId);
-      if (group) {
-        // Verify tabs are still in the group
-        const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-        tabGroupTabs = new Set(tabs.map((t) => t.id));
-        if (tabGroupTabs.size > 0) return;
+const MCP_GROUP_TITLE = "MCP";
+
+// Keep exactly one MCP group per browser. tabGroupId lives only in service
+// worker memory: after the worker is suspended a tool call can arrive before
+// any recovery runs, and creating a fresh group then left the operator with
+// several "MCP" groups. So every call looks the group up live, adopts the
+// existing one and merges duplicates into it. Calls are serialized: two
+// parallel tool calls must not both see "no group" and both create one.
+let ensureTabGroupLock = Promise.resolve();
+function ensureTabGroup(createIfEmpty) {
+  const run = ensureTabGroupLock.then(() => ensureTabGroupUnlocked(createIfEmpty));
+  ensureTabGroupLock = run.catch(() => {});
+  return run;
+}
+
+async function ensureTabGroupUnlocked(createIfEmpty) {
+  let groups = [];
+  try {
+    groups = await chrome.tabGroups.query({ title: MCP_GROUP_TITLE });
+  } catch {}
+
+  if (groups.length > 0) {
+    // Deterministic target: the group in use, else the oldest one.
+    const target =
+      groups.find((g) => g.id === tabGroupId) ||
+      groups.reduce((a, b) => (b.id < a.id ? b : a));
+    for (const g of groups) {
+      if (g.id === target.id) continue;
+      try {
+        const extra = await chrome.tabs.query({ groupId: g.id });
+        if (extra.length === 0) continue;
+        // Merge only when that does not pull tabs out of the operator's own
+        // windows: same window as the target, or a window holding nothing
+        // but this group (one we created; it closes once emptied).
+        if (g.windowId !== target.windowId) {
+          const others = await chrome.tabs.query({ windowId: g.windowId });
+          if (others.some((t) => t.groupId !== g.id)) continue;
+        }
+        await chrome.tabs.group({ groupId: target.id, tabIds: extra.map((t) => t.id) });
+      } catch (e) {
+        console.warn("MCP group merge failed:", e);
       }
-    } catch {
-      tabGroupId = null;
-      tabGroupTabs.clear();
+    }
+    const tabs = await chrome.tabs.query({ groupId: target.id });
+    if (tabs.length > 0) {
+      tabGroupId = target.id;
+      tabGroupTabs = new Set(tabs.map((t) => t.id));
+      return;
     }
   }
 
+  tabGroupId = null;
+  tabGroupTabs.clear();
   if (!createIfEmpty) return;
 
   // Create a new window with a tab, group it. focused:false — the window is
@@ -275,7 +311,7 @@ async function ensureTabGroup(createIfEmpty) {
   const win = await chrome.windows.create({ focused: false, url: "about:blank" });
   const tab = win.tabs[0];
   const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-  await chrome.tabGroups.update(groupId, { title: "MCP", color: "blue" });
+  await chrome.tabGroups.update(groupId, { title: MCP_GROUP_TITLE, color: "blue" });
   tabGroupId = groupId;
   tabGroupTabs = new Set([tab.id]);
 }
@@ -311,7 +347,7 @@ async function isInGroup(tabId) {
       if (tabGroupId === null) {
         try {
           const group = await chrome.tabGroups.get(tab.groupId);
-          if (group.title === "MCP") {
+          if (group.title === MCP_GROUP_TITLE) {
             tabGroupId = group.id;
             const groupTabs = await chrome.tabs.query({ groupId: tabGroupId });
             tabGroupTabs = new Set(groupTabs.map((t) => t.id));
@@ -3377,12 +3413,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 // Recover MCP tab group state after service worker restart
 async function recoverTabGroupState() {
   try {
-    const groups = await chrome.tabGroups.query({ title: "MCP" });
-    if (groups.length > 0) {
-      tabGroupId = groups[0].id;
-      const tabs = await chrome.tabs.query({ groupId: tabGroupId });
-      tabGroupTabs = new Set(tabs.map((t) => t.id));
-    }
+    await ensureTabGroup(false);
   } catch {
     // Not critical — will be set on first tabs_context_mcp call
   }
