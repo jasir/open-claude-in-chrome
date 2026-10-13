@@ -62,7 +62,7 @@ native host restartuje s dalším připojením rozšíření (nebo obnovit rozš
   každý má pracovat ve vlastní záložce (`tabs_create_mcp`).
 - `computer` → `screenshot` záložky na pozadí visí do timeoutu (20 s); nejdřív `set_tab_focus`.
   `get_page_text` a `navigate` fungují i na pozadí (ověřeno 2026-10-09 v Brave).
-- **Rozšíření „Clutter Free – Prevent duplicate tabs“** (v Brave na nb-asus i nb-dell): `navigate` na URL, které je už otevřené v jiné záložce, nechá MCP záložku na `about:blank` (Clutter Free navigaci zruší a přepne na existující záložku); `get_page_text` pak hlásí `Cannot access a chrome-extension:// URL of different extension`. Obejití: odlišit URL (např. `?ocic=1`). Ověřeno 2026-10-13 na nb-dell.
+- **Rozšíření „Clutter Free – Prevent duplicate tabs“** (v Brave na nb-asus i nb-dell): `navigate` na URL, které je už otevřené v jiné záložce, nechá MCP záložku na `about:blank` (nejspíš Clutter Free navigaci zruší a přepne na existující záložku; příčina odvozená, ne prověřená vypnutím rozšíření); `get_page_text` pak hlásí `Cannot access a chrome-extension:// URL of different extension`. Obejití: odlišit URL (např. `?ocic=1`). Ověřeno 2026-10-13 na nb-dell.
 - Upstream odstranil blocklist domén oficiálního rozšíření – agent smí kamkoli včetně bankovnictví.
 
 ## Testy
