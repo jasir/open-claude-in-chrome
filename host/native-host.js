@@ -16,6 +16,7 @@ import {
   clearStaleSocket,
   secureSocket
 } from "./endpoint.js";
+import { createFocusGuard } from "./focus-guard.js";
 
 // --- Native messaging protocol (Chrome <-> this process) ---
 
@@ -402,6 +403,22 @@ function handleWriteTempFile(msg) {
   }
 }
 
+// --- Focus guard (fork jasir, see focus-guard.js) ---
+// Our parent is the browser process; its windows carry that pid.
+const focusGuard = createFocusGuard({ browserPid: process.ppid });
+
+async function handleFocusGuard(msg) {
+  const reply = (payload) => writeNativeMessage({ id: msg.id, type: "focus_guard_reply", ...payload });
+  try {
+    const result = msg.type === "focus_guard_arm"
+      ? await focusGuard.arm({ ms: Number(msg.ms) || 10000, needSignal: msg.needSignal !== false })
+      : focusGuard.signal();
+    reply({ ok: true, result });
+  } catch (e) {
+    reply({ ok: false, error: String(e && e.message) });
+  }
+}
+
 // --- Main: bridge stdin (from extension) <-> the attached MCP clients ---
 
 let stdinBuffer = Buffer.alloc(0);
@@ -436,6 +453,10 @@ process.stdin.on("data", (chunk) => {
     }
     if (msg && msg.type === "write_temp_file") {
       handleWriteTempFile(msg);
+      continue;
+    }
+    if (msg && (msg.type === "focus_guard_arm" || msg.type === "focus_guard_signal")) {
+      handleFocusGuard(msg);
       continue;
     }
     // Everything else is a reply for a waiting MCP client; route it by id.

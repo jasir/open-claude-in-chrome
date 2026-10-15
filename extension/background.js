@@ -3,6 +3,8 @@
 
 import * as humanize from "./humanize/index.js";
 import * as audit from "./audit/index.js";
+import { gpayShim, GPAY_BINDING, normalizeGpaySites, hostMatches } from "./gpay/shim.js";
+import { scanFrame, clickMarked, assembleFrames, matchItem, formatFrames } from "./gpay/frames.js";
 
 // Prevent unhandled rejections from killing the service worker
 self.addEventListener("unhandledrejection", (event) => {
@@ -424,6 +426,7 @@ async function ensureAttached(tabId) {
         { tab: tabId, err: String(e && e.message).slice(0, 120) });
     console.warn("setFocusEmulationEnabled unavailable:", e.message);
   }
+  await installGpayShim(tabId);
   })();
   attachingTabs.set(tabId, attach);
   try {
@@ -523,6 +526,11 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 // --- CDP event listeners for console and network ---
 chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source.tabId;
+
+  if (method === "Runtime.bindingCalled" && params.name === GPAY_BINDING) {
+    onGpayOpened(tabId);
+    return;
+  }
 
   if (method === "Console.messageAdded" && params.message) {
     const msgs = consoleMessages.get(tabId) || [];
@@ -845,6 +853,157 @@ function writeScreenshotToDisk(base64) {
   });
 }
 
+// --- Google Pay as a tab, focus guard (fork jasir) ---
+// See extension/gpay/shim.js for why, host/focus-guard.js for the focus part.
+// The shim goes only into tabs we attach to (never the operator's own tabs)
+// and only does something on the sites in the gpay_tab_sites setting.
+
+function gpaySites(tabId) {
+  return normalizeGpaySites(effectiveConfig(tabId).gpay_tab_sites);
+}
+
+async function installGpayShim(tabId) {
+  const state = attachedTabs.get(tabId);
+  if (!state) return;
+  try {
+    await configHydrated;
+    if (state.gpayScriptId) {
+      await chrome.debugger.sendCommand({ tabId }, "Page.removeScriptToEvaluateOnNewDocument", { identifier: state.gpayScriptId }).catch(() => {});
+      state.gpayScriptId = null;
+    }
+    const sites = gpaySites(tabId);
+    if (!sites.length) return;
+    await ensureDomain(tabId, "Runtime");
+    // Without Page.enable the new-document script is accepted and never runs.
+    await ensureDomain(tabId, "Page");
+    // Bounded: this runs inside ensureAttached, and a stuck page must not
+    // block the attach.
+    const send = (method, params) => withTimeout(chrome.debugger.sendCommand({ tabId }, method, params), 3000, `CDP ${method}`);
+    await send("Runtime.addBinding", { name: GPAY_BINDING });
+    const source = `(${gpayShim.toString()})(${JSON.stringify(sites)});`;
+    const { identifier } = await send("Page.addScriptToEvaluateOnNewDocument", { source });
+    state.gpayScriptId = identifier;
+    // Also the document already loaded (skipped there if pay.js is already in).
+    const r = await send("Runtime.evaluate", { expression: source, returnByValue: true });
+    state.gpayShimNow = r?.result?.value || "?";
+    dbg("cdp", `gpay shim ${state.gpayShimNow} (sites ${sites.join(",")})`, { tab: tabId });
+  } catch (e) {
+    dbg("cdp", "gpay shim install FAILED", { tab: tabId, err: String(e && e.message).slice(0, 120) });
+  }
+}
+
+async function refreshGpayShims() {
+  for (const tabId of attachedTabs.keys()) await installGpayShim(tabId);
+}
+
+// Native focus-guard request with a short leash: an older native host does not
+// know these messages and would leave a plain nativeRequest hanging for 20s.
+function focusGuardRequest(msg, ms = 1500) {
+  return Promise.race([
+    nativeRequest(msg),
+    sleep(ms).then(() => { throw new Error("focus guard: no reply from native host"); })
+  ]);
+}
+
+const gpayOpenedAt = new Map(); // merchant tabId -> ms of the last Google Pay window.open
+
+async function onGpayOpened(tabId) {
+  // The binding is visible to every frame of an attached tab; act only for
+  // the configured merchant sites, and at most once a second.
+  let url = "";
+  try { url = (await chrome.tabs.get(tabId)).url || ""; } catch { return; }
+  if (!hostMatches(url, gpaySites(tabId))) return;
+  if (Date.now() - (gpayOpenedAt.get(tabId) || 0) < 1000) return;
+  gpayOpenedAt.set(tabId, Date.now());
+  // The new tab exists a moment after window.open returns.
+  for (const delay of [500, 1500]) {
+    setTimeout(async () => {
+      const tabs = await chrome.tabs.query({}).catch(() => []);
+      for (const t of tabs) if (t.openerTabId === tabId && isGpayUrl(t.url || t.pendingUrl || "")) await backgroundGpayTab(t.id);
+    }, delay);
+  }
+  dbg("tool", "gpay: page opened pay.google.com", { tab: tabId });
+  focusGuardRequest({ type: "focus_guard_signal" }).catch((e) =>
+    dbg("tool", "gpay: focus guard signal failed", { tab: tabId, err: String(e.message).slice(0, 120) }));
+}
+
+// Arm before an input action that may open Google Pay (merchant tab: restore
+// only once the page signals) or that clicks inside Google Pay itself.
+async function armFocusGuard(tabId, { needSignal = true, ms = 10000 } = {}) {
+  try {
+    const r = await focusGuardRequest({ type: "focus_guard_arm", ms, needSignal });
+    dbg("tool", `focus guard armed (prev 0x${Number(r?.prev || 0).toString(16)}, needSignal ${needSignal})`, { tab: tabId });
+    return true;
+  } catch (e) {
+    dbg("tool", "focus guard unavailable", { tab: tabId, err: String(e.message).slice(0, 120) });
+    return false;
+  }
+}
+
+const GPAY_ARMED_ACTIONS = new Set(["left_click", "double_click", "triple_click", "key"]);
+
+async function maybeArmForGpay(tabId, action) {
+  if (!GPAY_ARMED_ACTIONS.has(action)) return;
+  if (effectiveConfig(tabId).gpay_focus_guard === false) return;
+  let url = "";
+  try { url = (await chrome.tabs.get(tabId)).url || ""; } catch { return; }
+  if (isGpayUrl(url)) await armFocusGuard(tabId, { needSignal: false, ms: 4000 });
+  else if (hostMatches(url, gpaySites(tabId))) await armFocusGuard(tabId, { needSignal: true });
+}
+
+// Keep the Google Pay tab out of the foreground. Clicks into a SELECTED tab's
+// payments.google.com iframe make the browser activate its window (seen live:
+// every click stole focus); in a background tab the same clicks do not, and
+// the tab still loads, reads and clicks fine. Selecting a tab with
+// chrome.tabs.update does not activate the window.
+async function backgroundGpayTab(gpayTabId) {
+  try {
+    const t = await chrome.tabs.get(gpayTabId);
+    if (!t.active) return false;
+    let other = null;
+    if (t.openerTabId) other = await chrome.tabs.get(t.openerTabId).catch(() => null);
+    if (!other || other.windowId !== t.windowId) {
+      // Never select one of the operator's own tabs: only the MCP group.
+      const peers = t.groupId > 0 ? await chrome.tabs.query({ groupId: t.groupId }) : [];
+      other = peers.find((p) => p.id !== gpayTabId) || null;
+    }
+    if (!other) return false;
+    await chrome.tabs.update(other.id, { active: true });
+    dbg("tool", `gpay: tab ${gpayTabId} moved to the background (selected ${other.id})`, { tab: gpayTabId });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isGpayUrl(url) {
+  try { return new URL(url).hostname === "pay.google.com"; } catch { return false; }
+}
+
+// mark: tag elements so the gpay tool can DOM-click them; find/read_page don't.
+async function scanTabFrames(tabId, { mark = false } = {}) {
+  const nonce = mark ? `s${Date.now().toString(36)}` : null;
+  const results = await withTimeout(
+    chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: scanFrame, args: [nonce] }),
+    5000,
+    "iframe scan"
+  );
+  return assembleFrames(results);
+}
+
+async function findGpayTab(tabId) {
+  if (tabId !== undefined && tabId !== null) {
+    if (!(await isInGroup(tabId))) return null;
+    const t = await chrome.tabs.get(tabId).catch(() => null);
+    return t && isGpayUrl(t.url || t.pendingUrl || "") ? tabId : null;
+  }
+  await ensureTabGroup(false);
+  if (tabGroupId === null) return null;
+  const tabs = await chrome.tabs.query({ groupId: tabGroupId });
+  const gp = tabs.filter((t) => isGpayUrl(t.url || t.pendingUrl || ""));
+  return gp.length ? gp.sort((a, b) => b.id - a.id)[0].id : null;
+}
+
 // --- Mouse helpers ---
 // Brave withholds the debugger ack for synthesized mouse events (a constant
 // ~5s flush for move/press/release; mouseWheel is never acked at all) while
@@ -1008,7 +1167,17 @@ const CONFIG_SCHEMA = {
     "extension's isolated world, so the page cannot observe it, and captures DOM " +
     "rather than pixels — video and canvas content are not captured. This is a " +
     "mode rather than a flag because a future \"teach\" mode wants the opposite " +
-    "masking defaults."
+    "masking defaults.",
+  gpay_tab_sites:
+    "Comma-separated host suffixes (default \"kosik.cz\"; \"off\" disables), " +
+    "e.g. \"kosik.cz,localhost\": sites where Google Pay opens as an ordinary tab the agent can read and " +
+    "click (see the gpay tool) instead of the browser's payment sheet, which " +
+    "cannot be shown without stealing the operator's focus. Applies only to tabs " +
+    "this extension drives; takes effect on the next page load.",
+  gpay_focus_guard:
+    "true (default): when opening Google Pay makes the browser grab the operator's " +
+    "window focus, the native host gives it back (~0.1 s later; X11, needs xdotool " +
+    "and xprop). false: leave focus alone."
 };
 
 const AUDIT_MODES = ["off", "audit"];
@@ -1467,6 +1636,11 @@ const toolHandlers = {
       } catch {
         return { content: [{ type: "text", text: `Invalid URL: "${url}". Could not parse as a valid URL.` }] };
       }
+      // The Google Pay shim must be registered before the page loads (pay.js
+      // decides when it loads), and it is registered on attach.
+      if (hostMatches(targetUrl, gpaySites(tabId))) {
+        try { await ensureAttached(tabId); } catch {}
+      }
       await chrome.tabs.update(tabId, { url: targetUrl });
     }
 
@@ -1554,6 +1728,8 @@ const toolHandlers = {
       dbg("hit", `drag start @(${args.start_coordinate[0]},${args.start_coordinate[1]}) ${formatHit(probe)}`,
           { tab: tabId, x: args.start_coordinate[0], y: args.start_coordinate[1] });
     }
+
+    await maybeArmForGpay(tabId, action);
 
     switch (action) {
       case "screenshot": {
@@ -1918,6 +2094,15 @@ const toolHandlers = {
         else tree = treeDelta(prev.tree, tree) || "(delta: too many changes — full tree)\n" + tree;
       }
     }
+    if (args.frames) {
+      try {
+        const frames = await scanTabFrames(tabId);
+        const text = formatFrames(frames, { skipRoot: true });
+        tree += `\n\n${text ? `Iframe content (refs do not reach into iframes; click these by coordinate):\n${text}` : "(no visible iframe content)"}`;
+      } catch (e) {
+        tree += `\n\n(iframe scan failed: ${e.message})`;
+      }
+    }
     // Append viewport dimensions so Claude knows the coordinate space
     try {
       await ensureAttached(tabId);
@@ -1958,11 +2143,22 @@ const toolHandlers = {
     const resp = await sendContentMessage(tabId, { type: "findElements", query });
     const results = resp?.result || [];
 
-    if (results.length === 0) {
+    // Content inside iframes (cross-origin included) is invisible to the
+    // content script; search it too. Those hits have no ref, only coordinates.
+    let frameHits = [];
+    try {
+      const q = String(query).toLowerCase();
+      frameHits = (await scanTabFrames(tabId))
+        .filter((f) => f.depth > 0)
+        .flatMap((f) => f.items.filter((i) => `${i.role} ${i.text}`.toLowerCase().includes(q)).map((i) => ({ ...i, href: f.href })))
+        .slice(0, Math.max(0, 20 - results.length));
+    } catch {}
+
+    if (results.length === 0 && frameHits.length === 0) {
       return { content: [{ type: "text", text: `No elements found matching "${query}"` }] };
     }
 
-    let text = `Found ${results.length} element(s) matching "${query}":\n\n`;
+    let text = `Found ${results.length + frameHits.length} element(s) matching "${query}":\n\n`;
     let anyOff = false;
     for (const r of results) {
       text += `[${r.ref}] ${r.role} "${r.name}" at (${r.coordinates[0]}, ${r.coordinates[1]})`;
@@ -1972,6 +2168,12 @@ const toolHandlers = {
       }
       text += `\n`;
     }
+    for (const h of frameHits) {
+      let origin = h.href;
+      try { origin = new URL(h.href).origin; } catch {}
+      text += `[iframe ${origin}] ${h.role} "${h.text.slice(0, 80)}" at (${h.x}, ${h.y})${h.disabled ? " (disabled)" : ""}${h.offscreen ? " [OFF-VIEWPORT]" : ""}\n`;
+    }
+    if (frameHits.length) text += `\nIframe entries have no ref: click them with computer left_click at the given coordinates.\n`;
     if (anyOff) {
       // Handing out coordinates that cannot be clicked is how a silent miss
       // starts: the click dispatches fine and lands on the document root.
@@ -1983,6 +2185,153 @@ const toolHandlers = {
     }
 
     return { content: [{ type: "text", text }] };
+  },
+
+  // Hidden (not in tool-definitions, so agents never see it): reload the
+  // extension from disk after a code change, without anyone clicking reload
+  // in …://extensions. Call it through host/tool-runtime.js callTool.
+  async reload_extension() {
+    setTimeout(() => chrome.runtime.reload(), 300);
+    return { content: [{ type: "text", text: "Reloading the extension in 300 ms; the native host restarts with it." }] };
+  },
+
+  // Google Pay opened as a tab (fork jasir; see extension/gpay/shim.js).
+  async gpay(args) {
+    const action = args.action || "read";
+    const say = (text) => ({ content: [{ type: "text", text }] });
+    const tabId = await findGpayTab(args.tabId);
+    if (!tabId) {
+      return say(
+        "No Google Pay tab (pay.google.com) in the MCP group. Click the merchant's Google Pay " +
+        "button with computer left_click in a tab of a site listed in gpay_tab_sites (default " +
+        "kosik.cz); Google Pay then opens here as a tab instead of the browser's payment sheet. " +
+        "If that click did nothing: a merchant page loaded before this extension attached to its tab " +
+        "keeps the payment sheet; reload it (navigate) and click again."
+      );
+    }
+    await backgroundGpayTab(tabId);
+    const scan = () => scanTabFrames(tabId, { mark: true });
+    let lastScanError = null;
+    const waitFor = async (pred, ms) => {
+      const t0 = Date.now();
+      for (;;) {
+        let frames = [];
+        try { frames = await scan(); lastScanError = null; } catch (e) { lastScanError = e; }
+        const hit = pred(frames);
+        if (hit || Date.now() - t0 >= ms) return { frames, hit };
+        await sleep(300);
+      }
+    };
+    const ready = (frames) => frames.some((f) => f.items.length);
+    // Google Pay animates its card list, slowly in a background tab. Read and
+    // choose only once what it shows held still across two scans.
+    const sig = (frames) => frames.map((f) => f.items.map((i) => `${i.text}@${i.x},${i.y}`).join("|")).join("#");
+    const settle = async (ms = 4000) => {
+      const t0 = Date.now();
+      let prev = await scan().catch(() => []);
+      for (;;) {
+        await sleep(350);
+        const cur = await scan().catch(() => []);
+        if ((sig(cur) === sig(prev) && ready(cur)) || Date.now() - t0 >= ms) return cur;
+        prev = cur;
+      }
+    };
+    const report = (frames, prefix = "") => say(`${prefix}Google Pay tab ${tabId}:\n${formatFrames(frames) || "(nothing visible yet)"}`);
+    // DOM click inside the element's own frame; see clickMarked for why not input.
+    const click = async (item) => {
+      const [r] = await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [item.frameId] }, func: clickMarked, args: [item.mark]
+      });
+      dbg("tool", `gpay click "${item.text.slice(0, 60)}"${r?.result ? "" : " — ELEMENT GONE"}`, { tab: tabId });
+      if (!r?.result) throw new Error(`"${item.text.slice(0, 60)}" disappeared before it could be clicked; read again.`);
+    };
+    // Card rows and list options, not the page body, the listbox around them or
+    // inner jsaction divs (clicking those does not select the card).
+    const CARD_ROLES = ["button", "option", "radio", "menuitemradio", "menuitem", "link", "a"];
+    const bullet = (i) => /[•·∙]/.test(i.text) && i.text.length < 160 && CARD_ROLES.includes(i.role);
+    const cardOf = (frames) => frames.flatMap((f) => f.items).filter(bullet);
+    const norm = (t) => String(t).toLowerCase().replace(/[•·∙]+/g, "•").replace(/\s+/g, " ");
+
+    let { frames } = await waitFor(ready, 8000);
+    if (!ready(frames)) {
+      return report(frames, lastScanError ? `Could not read the Google Pay tab: ${lastScanError.message}. ` : "Google Pay is not ready yet (still loading?). ");
+    }
+
+    if (action === "read") return report(await settle());
+
+    if (action === "click") {
+      if (!args.text) return say("gpay click needs 'text' (visible text of the element).");
+      frames = await settle();
+      const item = matchItem(frames, args.text);
+      if (!item) return report(frames, `Nothing clickable matches "${args.text}". `);
+      await click(item);
+      await sleep(1000);
+      return report(await scan(), `Clicked "${item.text.slice(0, 80)}". `);
+    }
+
+    if (action === "select_card") {
+      const q = norm(args.card || "");
+      if (!q.trim()) return say("gpay select_card needs 'card' (e.g. \"5729\" or \"Airbank\").");
+      frames = await settle();
+      const cards = cardOf(frames);
+      if (cards.length === 1 && norm(cards[0].text).includes(q)) {
+        return report(frames, `Card "${cards[0].text}" is already selected. `);
+      }
+      let row = null;
+      if (cards.length <= 1) {
+        row = cards[0];
+        if (!row) return report(frames, "Could not find the selected-card row. ");
+        // Open the list (one retry if it does not appear).
+        for (let attempt = 0; attempt < 2; attempt++) {
+          await click(row);
+          ({ frames } = await waitFor((f) => cardOf(f).length > 1, 4000));
+          if (cardOf(frames).length > 1) break;
+          frames = await settle();
+          row = cardOf(frames)[0] || row;
+        }
+        frames = await settle();
+      }
+      const target = matchItem(frames, args.card, {
+        filter: (i) => CARD_ROLES.includes(i.role) && !i.disabled && (!row || i.x !== row.x || i.y !== row.y)
+      });
+      if (!target) {
+        // Leave Google Pay as we found it: close the list we opened.
+        const back = row && (matchItem(frames, "Zpět", { filter: (i) => norm(i.text).trim() === "zpět" }) ||
+          matchItem(frames, "Back", { filter: (i) => norm(i.text).trim() === "back" }));
+        if (back) { await click(back); frames = await settle(); }
+        return report(frames, `No selectable card matching "${args.card}" (unavailable cards don't count)${back ? "; list closed again" : ""}. `);
+      }
+      await click(target);
+      const done = await waitFor((f) => {
+        const c = cardOf(f);
+        return c.length === 1 && norm(c[0].text).includes(q);
+      }, 5000);
+      return report(done.frames, done.hit ? `Selected "${target.text}". ` : `Clicked "${target.text}", but could not confirm it is now the selected card. `);
+    }
+
+    if (action === "pay") {
+      frames = await settle();
+      // Only the pay button itself; any other step (Pokračovat, Continue, ...)
+      // must be named explicitly with `text`, because this click spends money.
+      const labels = args.text ? [args.text] : ["Zaplatit", "Pay"];
+      let item = null;
+      for (const l of labels) {
+        item = matchItem(frames, l, { filter: (i) => !i.disabled && norm(i.text).trim() === norm(l).trim() });
+        if (item) break;
+      }
+      if (!item) return report(frames, `No enabled pay button (${labels.join(" / ")}). `);
+      await click(item);
+      const t0 = Date.now();
+      while (Date.now() - t0 < 8000) {
+        await sleep(500);
+        try { await chrome.tabs.get(tabId); } catch {
+          return say(`Clicked "${item.text}". The Google Pay tab closed: the payment was handed back to the merchant page. Check the merchant tab for the result.`);
+        }
+      }
+      return report(await scan(), `Clicked "${item.text}". Google Pay is still open (it may be waiting for confirmation on the phone):\n`);
+    }
+
+    return say(`Unknown gpay action "${action}". Use read, select_card, pay or click.`);
   },
 
   async form_input(args) {
@@ -2641,6 +2990,8 @@ const toolHandlers = {
     // before relying on it — and get_config would report activeHand: null.
     // Priming here makes the hand inspectable the moment it is configured, and
     // lets this call report exactly what it built.
+    if (key === "gpay_tab_sites") await refreshGpayShims();
+
     let handNote = "";
     if (key === "humanize_seed" || key === "humanize" || key === "humanize_speed") {
       const s = human(effective.humanize_speed, effective.humanize_seed);

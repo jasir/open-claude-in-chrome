@@ -188,7 +188,7 @@ export const TOOLS = [
   {
     name: "find",
     description:
-      'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
+      'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Returns up to 20 matching elements with references that can be used with other tools. Also searches inside iframes (cross-origin included); iframe matches have no ref, only coordinates for computer left_click. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
     paramShape: {
       query: z
         .string()
@@ -421,7 +421,24 @@ export const TOOLS = [
         .optional()
         .describe(
           "Set true to return only the lines that changed since the previous read_page of this tab with the same URL and options (lines prefixed '- ' removed, '+ ' added, '@@ line N @@' = position in the new tree), or 'Unchanged' when nothing changed. Refs in unchanged lines stay valid. Only use it while the previous read_page output is still in your context. Falls back to the full tree on the first call, after navigation, when output is truncated, or when most of the page changed. Default false."
+        ),
+      frames: z
+        .boolean()
+        .optional()
+        .describe(
+          "Set true to append what visible iframes show (cross-origin included, e.g. payment widgets): their text and clickable elements with top-level coordinates for computer left_click. The tree itself never reaches into iframes. Default false."
         )
+    }
+  },
+  {
+    name: "gpay",
+    description:
+      "Drive Google Pay without the browser's payment sheet and without taking the operator's focus. On sites in the gpay_tab_sites setting (default kosik.cz) the merchant's Google Pay button, clicked with computer left_click, opens pay.google.com as a tab in the MCP group instead of the sheet. This tool reads and clicks that tab (its content is a cross-origin iframe that read_page cannot see). Actions: read (text and clickable elements), select_card (open the card list and pick the card whose text contains `card`, e.g. \"5729\"), pay (click the button labelled exactly Zaplatit or Pay, or `text`; the tab closes when the payment is handed back to the merchant, or stays open while Google waits for confirmation on the phone), click (click the element whose text contains `text`). Clicks are DOM clicks inside the Google Pay frame and the tab is kept in the background, so nothing here moves the operator's focus; no screenshot needed.",
+    paramShape: {
+      action: z.enum(["read", "select_card", "pay", "click"]).describe("What to do in the Google Pay tab."),
+      card: z.string().optional().describe("For select_card: text identifying the card, e.g. \"5729\" or \"Airbank\"."),
+      text: z.string().optional().describe("For click: visible text of the element. For pay: override the button label."),
+      tabId: z.number().optional().describe("Google Pay tab ID. Default: the newest pay.google.com tab in the MCP group.")
     }
   },
   {

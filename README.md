@@ -23,6 +23,20 @@ Fork [noemica-io/open-claude-in-chrome](https://github.com/noemica-io/open-claud
   Po navigaci, změně filtru, oříznutí `max_chars` nebo velké změně vrátí celý strom.
   `computer` → `screenshot` s `if_changed: true` stejný obrázek znovu neposílá,
   vrátí ID předchozího.
+- **Google Pay bez platebního listu a bez fokusu** (nástroj `gpay`, nastavení `gpay_tab_sites`, výchozí `kosik.cz`).
+  Nativní platební list (PaymentRequest) Chromium neukáže, když okno prohlížeče není aktivní
+  (`payment_request.cc`: `IsBrowserWindowActive` → „Cannot show PaymentRequest UI in a preview page
+  or a background tab.“). Proto v záložkách, které ovládá MCP, a jen na nastavených webech skript
+  před načtením stránky schová `PaymentRequest` (`extension/gpay/shim.js`). pay.js Googlu pak otevře
+  pay.google.com přes `window.open`, a to jako záložku ve skupině MCP, ne jako okno.
+  `gpay` (`read`, `select_card`, `pay`, `click`) tu záložku drží na pozadí a kliká DOM klikem
+  přímo v iframu payments.google.com. Myší (CDP) by každý klik do iframu ve vybrané záložce aktivoval
+  okno. `find` a `read_page` s `frames: true` vidí i obsah iframů.
+  Otevření záložky z `window.open` Brave aktivuje vždy. Native host proto před klikem zapamatuje
+  aktivní okno a po signálu ze stránky ho vrátí (`host/focus-guard.js`, xdotool + xprop, jen X11;
+  vypnout jde nastavením `gpay_focus_guard: false`). Jardovi tak zmizí fokus jednou na ~0,2 s.
+  Ověřeno 2026-10-16 v Brave na testovací stránce s pay.js (TEST):
+  tlačítko → read → select_card 4444/1111/4445 → pay → stránka dostala kartu 4445.
 - **Líné MCP:** `mcp-register.sh` registruje servery přes `~/scripts-ai/mcp-lazy`, node běží jen při používání.
 
 ## Architektura
@@ -51,7 +65,7 @@ Claude Code ─stdio MCP─ mcp-server.js --browser chrome ─ bridge-chrome.soc
 3. Nová session agenta → nástroje `mcp__ocic-<jméno>__*`; první volání `tabs_context_mcp`.
 
 Odebrání: `./install.sh --remove jméno`, `./mcp-register.sh --remove jméno`.
-Po změně `extension/` stačí v `…://extensions` kliknout na obnovit; po změně `host/` se
+Po změně `extension/` stačí v `…://extensions` kliknout na obnovit (od verze s nástrojem `gpay` jde i bez myši: skrytý nástroj `reload_extension` přes `callTool` z `host/tool-runtime.js`, agentům se nenabízí); po změně `host/` se
 native host restartuje s dalším připojením rozšíření (nebo obnovit rozšíření).
 
 ## Omezení
@@ -64,6 +78,15 @@ native host restartuje s dalším připojením rozšíření (nebo obnovit rozš
   `get_page_text` a `navigate` fungují i na pozadí (ověřeno 2026-10-09 v Brave).
 - **Rozšíření „Clutter Free – Prevent duplicate tabs“** (v Brave na nb-asus i nb-dell): `navigate` na URL, které je už otevřené v jiné záložce, nechá MCP záložku na `about:blank` (nejspíš Clutter Free navigaci zruší a přepne na existující záložku; příčina odvozená, ne prověřená vypnutím rozšíření); `get_page_text` pak hlásí `Cannot access a chrome-extension:// URL of different extension`. Obejití: odlišit URL (např. `?ocic=1`). Ověřeno 2026-10-13 na nb-dell.
 - Upstream odstranil blocklist domén oficiálního rozšíření – agent smí kamkoli včetně bankovnictví.
+
+- `gpay`: nekontroluje částku ani obchodníka, to musí udělat agent z `gpay read` před `pay`.
+  Shim schová `PaymentRequest` na celém nastaveném webu (na kosik.cz tedy i pro jiné platby přes
+  PaymentRequest) a do každé připojené záložky přidá `Runtime.enable`, `Page.enable` a binding
+  `__ocicGpayOpen`. Stránka binding vidí, ale volání mimo nastavené weby se ignorují.
+- `gpay`: potvrzení platby na telefonu zůstává na člověku. Když Google změní strukturu stránky
+  pay.google.com, `select_card`/`pay` nemusí najít prvek. `gpay read` a `gpay click` pak ukážou,
+  co na stránce je. Na webu, který volá `PaymentRequest` přímo (bez pay.js), schování
+  `PaymentRequest` platbu Google Pay vypne. Proto je seznam webů výslovný.
 
 ## Testy
 
