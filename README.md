@@ -37,6 +37,14 @@ Fork [noemica-io/open-claude-in-chrome](https://github.com/noemica-io/open-claud
   vypnout jde nastavením `gpay_focus_guard: false`). Jardovi tak zmizí fokus jednou na ~0,2 s.
   Ověřeno 2026-10-16 v Brave na testovací stránce s pay.js (TEST):
   tlačítko → read → select_card 4444/1111/4445 → pay → stránka dostala kartu 4445.
+- **Vlastní prohlížeč pro agenta na virtuálním displeji** (`xvfb-instance.sh`, plán B v
+  `docs/plan-b-karel-xvfb.md`). Brave s vlastním profilem běží na Xvfb jako systemd user služba
+  (`ocic-<jméno>.service` + `ocic-xvfb-<jméno>.service`, `RuntimeMaxSec`), rozšíření se načte přes
+  `--load-extension`, agent má MCP server `ocic-<jméno>`. Operátorovi nebere fokus vůbec, ani na 0,2 s.
+  Přihlášení na weby udělá jednou člověk: `./xvfb-instance.sh login <jméno>` (stejný profil viditelně).
+  Brave pro instanci s `--user-data-dir` spouští native host výchozího profilu; host se proto
+  přejmenuje podle `--user-data-dir` svého rodiče (`host/instance-name.js`, registr
+  `~/.config/open-claude-in-chrome/instances.tsv`, plní ho `install.sh`).
 - **Líné MCP:** `mcp-register.sh` registruje servery přes `~/scripts-ai/mcp-lazy`, node běží jen při používání.
 
 ## Architektura
@@ -64,9 +72,29 @@ Claude Code ─stdio MCP─ mcp-server.js --browser chrome ─ bridge-chrome.soc
    zálohy konfigurací do `~/.config/mcp-lazy-zalohy/`.
 3. Nová session agenta → nástroje `mcp__ocic-<jméno>__*`; první volání `tabs_context_mcp`.
 
-Odebrání: `./install.sh --remove jméno`, `./mcp-register.sh --remove jméno`.
+Odebrání: `./install.sh --remove jméno` (vlastní instance `jméno=adresář`), `./mcp-register.sh --remove jméno`.
 Po změně `extension/` stačí v `…://extensions` kliknout na obnovit (od verze s nástrojem `gpay` jde i bez myši: skrytý nástroj `reload_extension` přes `callTool` z `host/tool-runtime.js`, agentům se nenabízí); po změně `host/` se
 native host restartuje s dalším připojením rozšíření (nebo obnovit rozšíření).
+
+### Instance na Xvfb (příklad: Karel)
+
+```bash
+./xvfb-instance.sh install karel            # profil ~/.config/brave-karel, displej :99, max 2 h běhu
+./xvfb-instance.sh login karel https://accounts.google.com https://www.kosik.cz   # jednou, člověk
+systemctl --user start ocic-karel.service   # agent před prací …
+systemctl --user stop ocic-karel.service    # … a po ní
+```
+
+`--password-store=basic`: cookies v profilu (přihlášení do Google a e-shopu) jsou šifrované jen
+slabě, profil chraň jako heslo. `RuntimeMaxSec` (výchozí 2 h) prohlížeč natvrdo ukončí, i uprostřed
+nákupu. Odebrání: `./xvfb-instance.sh remove karel` (profil zůstane). Jména `brave`, `chrome`
+a `chrome-debug` jsou vyhrazená. Native host, kterého spustí neregistrovaná instance s
+`--user-data-dir`, se raději ukončí (záznam v `host-exits.log`), než aby převzal cizí most.
+
+V instanci nikdo nesedí, takže agent smí svou záložku vybrat (`set_tab_focus`). Bez toho
+klik do nově vytvořené záložky na pozadí nemusí projít (seen 2026-10-16) a `screenshot` visí.
+Po změně `extension/` instanci restartovat (`stop` + `start`); `reload_extension` rozšíření
+načtené přes `--load-extension` neobnoví.
 
 ## Omezení
 

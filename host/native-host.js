@@ -17,6 +17,19 @@ import {
   secureSocket
 } from "./endpoint.js";
 import { createFocusGuard } from "./focus-guard.js";
+import { resolveInstance } from "./instance-name.js";
+
+// A --user-data-dir instance of Brave launches the DEFAULT profile's wrapper
+// (see instance-name.js); take the name of the instance that really spawned us,
+// and never serve an unknown instance under someone else's name.
+{
+  const r = resolveInstance();
+  if (r.refuse) {
+    recordExit(`refused: ${r.refuse}`);
+    process.exit(1);
+  }
+  if (r.name && r.name !== process.env.OCIC_BROWSER) process.env.OCIC_BROWSER = r.name;
+}
 
 // --- Native messaging protocol (Chrome <-> this process) ---
 

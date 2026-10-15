@@ -75,6 +75,31 @@ if [[ $REMOVE -eq 0 && ! -d "$HOST_DIR/node_modules" ]]; then
   npm install --prefix "$HOST_DIR" --no-fund --no-audit
 fi
 
+# Jméno ↔ user-data-dir pro native host (host/instance-name.js): Brave instance
+# s --user-data-dir spouští wrapper výchozího profilu, host se proto podle
+# --user-data-dir svého rodiče přejmenuje sám.
+REGISTRY="$HOME/.config/open-claude-in-chrome/instances.tsv"
+registry_set() { # jméno [adresář]  (bez adresáře = odebrat)
+  mkdir -p "$(dirname "$REGISTRY")"; touch "$REGISTRY"
+  python3 - "$REGISTRY" "$@" <<'EOF'
+import os, sys
+path, name, *rest = sys.argv[1:]
+new_dir = os.path.realpath(os.path.expanduser(rest[0])) if rest else None
+keep = []
+for line in open(path).read().splitlines():
+    parts = line.split("\t")
+    if len(parts) != 2 or parts[0] == name or (new_dir and os.path.realpath(parts[1]) == new_dir):
+        continue
+    keep.append(line)
+if new_dir:
+    keep.append(f"{name}\t{new_dir}")
+# Atomicky: native host startující během zápisu nesmí vidět prázdný registr.
+tmp = path + ".tmp"
+open(tmp, "w").write("".join(k + "\n" for k in keep))
+os.replace(tmp, path)
+EOF
+}
+
 for t in "${TARGETS[@]}"; do
   IFS=$'\t' read -r name dir <<<"$t"
   wrapper="$HOST_DIR/native-host-$name.sh"
@@ -82,6 +107,7 @@ for t in "${TARGETS[@]}"; do
 
   if [[ $REMOVE -eq 1 ]]; then
     rm -f "$wrapper" "$manifest"
+    registry_set "$name"
     echo "  $name: odregistrováno"
     continue
   fi
@@ -94,7 +120,7 @@ for t in "${TARGETS[@]}"; do
   cat >"$wrapper" <<EOF
 #!/bin/sh
 # Vygenerováno install.sh – native host pro prohlížeč '$name' ($dir).
-OCIC_BROWSER='$name' exec '$NODE' '$HOST_DIR/native-host.js' "\$@"
+OCIC_BROWSER='$name' OCIC_USER_DATA_DIR='$dir' exec '$NODE' '$HOST_DIR/native-host.js' "\$@"
 EOF
   chmod +x "$wrapper"
 
@@ -110,6 +136,7 @@ json.dump({
     "allowed_origins": [f"chrome-extension://{ext_id}/"],
 }, open(path, "w"), indent=2)
 EOF
+  registry_set "$name" "$dir"
   echo "  $name: $manifest"
 done
 

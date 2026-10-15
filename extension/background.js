@@ -976,6 +976,15 @@ async function backgroundGpayTab(gpayTabId) {
   }
 }
 
+async function gpaySignInTab() {
+  if (tabGroupId === null) return null;
+  const tabs = await chrome.tabs.query({ groupId: tabGroupId }).catch(() => []);
+  return tabs.find((t) => {
+    const u = t.url || t.pendingUrl || "";
+    return /^https:\/\/accounts\.google\.com\//.test(u) && /continue=https(%3A|:)(%2F|\/){2}pay\.google\.com/i.test(u);
+  }) || null;
+}
+
 function isGpayUrl(url) {
   try { return new URL(url).hostname === "pay.google.com"; } catch { return false; }
 }
@@ -2201,6 +2210,16 @@ const toolHandlers = {
     const say = (text) => ({ content: [{ type: "text", text }] });
     const tabId = await findGpayTab(args.tabId);
     if (!tabId) {
+      // pay.google.com sends a profile that is not signed in to Google to the
+      // sign-in page; that tab is no longer a pay.google.com tab.
+      const signin = await gpaySignInTab();
+      if (signin) {
+        return say(
+          `Google Pay needs a Google sign-in in this browser profile: tab ${signin.id} shows the Google ` +
+          "sign-in page. A person has to sign in (agents must not type credentials); then click the " +
+          "merchant's Google Pay button again."
+        );
+      }
       return say(
         "No Google Pay tab (pay.google.com) in the MCP group. Click the merchant's Google Pay " +
         "button with computer left_click in a tab of a site listed in gpay_tab_sites (default " +

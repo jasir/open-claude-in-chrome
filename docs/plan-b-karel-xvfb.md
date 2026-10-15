@@ -1,6 +1,6 @@
 # Plán B: vlastní Brave pro Karla na virtuálním displeji
 
-Stav: jen plán (2026-10-16), nic z toho není implementované.
+Stav: implementováno 2026-10-16 (`xvfb-instance.sh`, viz README). Odchylky od plánu níže v „Skutečnost“.
 
 ## Cíl
 
@@ -65,3 +65,14 @@ a požádá Jardu přes Felixe o kroky 1, 3 a 4.
 - Jednorázové přihlášení s Jardou: 15 min jeho času.
 - Ověření celého nákupu na testovací stránce a úprava Karla: 1,5 h.
 - Celkem asi půl dne. Kód rozšíření se nemění, A je v něm hotové.
+
+## Skutečnost (implementace 2026-10-16)
+
+1. `--load-extension` v Brave 153 funguje, ruční načtení rozšíření v profilu odpadlo.
+2. Brave pro `--user-data-dir` instanci čte manifest native hostu z VÝCHOZÍHO profilu, takže
+   spustil host pod jménem `brave` (soupeřil by s Jardovým Brave o most). Řeší
+   `host/instance-name.js`: host se přejmenuje podle `--user-data-dir` rodiče.
+3. Na Xvfb bez window manageru nefunguje `xdotool getactivewindow`; hlídání fokusu z A se tam
+   tiše vypne (není co hlídat).
+4. Klik do nové záložky na pozadí v instanci neprošel; po `set_tab_focus` ano. Agent v instanci
+   proto svou záložku vybere.
